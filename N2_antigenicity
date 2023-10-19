@@ -1,0 +1,322 @@
+#Opening the table with NAI titers
+
+library(tibble)
+EC50.table <- read.csv("EC50.csv")
+EC50.table <-column_to_rownames(EC50.table , var = "X")
+Nantigens <- ncol(EC50.table)
+Nsera <- nrow(EC50.table)
+antigens <- colnames(EC50.table)
+sera <- rownames(EC50.table)
+
+# renormalize for each ANTIGEN, then compute difference for serum pairs
+Dren.antigens <- matrix(nrow=Nsera,ncol=Nantigens)
+for (j in 1:Nantigens) {
+  Dren.antigens[,j] <- log2(max(EC50.table[,j])/EC50.table[,j])
+}
+Dpairs.sera <- matrix(nrow=Nsera,ncol=Nsera)
+for (i in 1:Nsera) {
+  for (j in 1:Nsera) {
+    Dpairs.sera[i,j] <- sum(abs(Dren.antigens[i,]-Dren.antigens[j,]))/Nantigens
+  }
+}
+rownames(Dpairs.sera) <- sera
+colnames(Dpairs.sera) <- sera
+
+AD <- Dpairs.sera
+
+#getting the sequences: here we are using only NA head domains, which correspond the recombinant protein sequence used to boost ferrets. 
+
+dataSeq <- read.csv2("SequencesClean.csv",row.names=1,
+                     colClasses=c("character"))
+
+#Excel made a mess saving to csv
+#Remove empty rows and columns
+dataSeq2 <- dataSeq[,c(-(1:9),-(397:1445))]
+
+#Select non-conserved positions ####
+Cons <- apply(dataSeq2,2,function(x) sum(x!=rep(x[1],44)))
+S <- dataSeq2[Cons!=0]
+#This is what the publication calls S
+
+
+#Create feature vector with simple M-MM ####
+nr <- factorial(nrow(S))/(factorial(2)*factorial(nrow(S)-2))
+X <- matrix(2,nrow=nr,ncol=ncol(S))
+for (k in 1:ncol(S))
+{
+  Comp <- outer(1:44,1:44,FUN=Vectorize(function(i,j) 
+    (S[i,k]!=S[j,k])))
+  X[,k] <- t(Comp)[lower.tri(t(Comp))]
+}
+
+rnames <- c()
+for (i in 1:(nrow(S)-1))
+{
+  for (j in (i+1):nrow(S))
+  {
+    rnames <- c(rnames,paste0(rownames(S[i,]),"-",
+                              rownames(S[j,])))
+  }
+}
+rownames(X) <- rnames
+colnames(X) <- colnames(S)
+#This is what the publication calls X
+
+
+#Check the order of the rows
+sum(rownames(S)!=rownames(AD))
+Y <- t(AD)[lower.tri(t(AD))]
+names(Y) <- rnames
+
+
+#Random Forest model ####
+library(randomForest)
+
+#Cross validation is not necessary for random forests
+#Is done by mtry and by selecting data with replacement
+#He will automatically take the non selected data as test
+#when not using a train and test set
+?randomForest
+rf <- randomForest(X,y=Y,ntree=1500,mtry=25,keep.forest=TRUE,
+                   importance=TRUE) 
+
+#Prediction accuracy
+rf
+
+#He has created 1500 decision trees: look at the first tree
+getTree(rf,1)
+
+#Find relevant features ####
+#Look at the minimal depth distribution
+library(randomForestExplainer)
+#Various measures to express importance of AA
+mindepth <- min_depth_distribution(rf)
+head(mindepth,10)
+library(reshape2)
+MD <- dcast(mindepth,tree~variable)
+MD[is.na(MD)] <- 19
+meanMD <- colMeans(MD[2:101],na.rm=TRUE)
+resMD <- as.data.frame(sort(meanMD))
+write.csv2(resMD,file="resMMD.csv",
+           quote=FALSE)
+#Depth of the node which splits on that variable
+#and is the closest to the root of the tree
+#low => more important => a lot of observations 
+#are divided into groups based on this variable
+plot_min_depth_distribution(mindepth,k=100)
+?plot_min_depth_distribution
+#315 is the most important
+
+#Importance of each feature in the model
+library(caret)
+OvI <- varImp(rf)
+OvI$pos <- rownames(vI)
+resOvI <- OvI[order(OvI$Overall,decreasing=TRUE),]
+resOvI$pos <- NULL
+write.csv2(resOvI,file="resPctIncMSE.csv",quote=FALSE)
+varImpPlot(rf,type=1,n.var=100)
+
+#402 is most important
+#importance = mean decrease of accuracy in predictions 
+#on out of bag samples when variable is excluded from model 
+
+#More elaborate importance measures
+importance <- measure_importance(rf)
+head(importance)
+resMD2 <- importance[order(importance$mean_min_depth),1:2]
+#same as resMD
+write.csv2(resMD2,file="resMMD2.csv",
+           quote=FALSE,row.names=FALSE)
+
+#no_of_nodes: number of nodes that use variable for splitting
+#high -> more important
+resNN <- importance[order(importance$no_of_nodes,
+                          decreasing=TRUE),c(1,3)]
+write.csv2(resNN,file="resNumberNodes.csv",
+           quote=FALSE,row.names=FALSE)
+
+#mse_increase: increase of mean squared error after variable is permuted
+#high -> more important
+resMSE <- importance[order(importance$mse_increase,
+                           decreasing=TRUE),c(1,4)]
+write.csv2(resMSE,file="resMSEIncrease.csv",
+           quote=FALSE,row.names=FALSE)
+
+#no_of_trees: number of trees that use variable
+#high -> more important
+resNT <- importance[order(importance$no_of_trees,
+                          decreasing=TRUE),c(1,6)]
+write.csv2(resNT,file="resNumberTrees.csv",
+           quote=FALSE,row.names=FALSE)
+
+#times_a_root: number of trees that use variable in root node
+#high -> more important
+resxRoot <- importance[order(importance$times_a_root,
+                             decreasing=TRUE),c(1,7)]
+write.csv2(resxRoot,file="resTimesaRoot.csv",
+           quote=FALSE,row.names=FALSE)
+
+#p-value: does the observed number of nodes 
+#in which variable was used for splitting exceed
+#the theoretical number if they were random?
+#low -> more important
+#times_a_root: number of trees that use variable in root node
+#high -> more important
+resP <- importance[order(importance$p_value),c(1,8)]
+write.csv2(resP,file="resPval.csv",
+           quote=FALSE,row.names=FALSE)
+
+importance[importance$variable=='X315',]
+importance[importance$variable=='X402',]
+#Plot importance
+plot_multi_way_importance(importance,
+                          x_measure="mean_min_depth",
+                          y_measure="mse_increase",
+                          size_measure="no_of_nodes",
+                          no_of_labels = 20)+
+  theme_classic()+
+  theme(axis.text = element_text(size=12))+
+  theme(axis.title = element_text(size=12))
+
+#Accuracy 
+y_hat <- predict(rf)
+train_scored <- cbind(X,Yc,y_hat)
+head(train_scored)
+library(ggplot2)
+library(ggpmisc)
+my.formula <- y ~ x
+ggplot(as.data.frame(train_scored),aes(Yc,y_hat)) + 
+  geom_point() + geom_smooth(method="lm",se=FALSE) + 
+  stat_poly_eq(formula=my.formula,
+               aes(label=..rr.label..),
+               parse=TRUE) + 
+  xlab("Observed") + 
+  ylab("Predicted")+
+  theme_classic()
+
+#Root Mean Square Error for training set
+library(yardstick)
+RMSETrain <- yardstick::rmse(as.data.frame(train_scored),
+                             truth=Yc,
+                             estimate=y_hat)
+RMSETrain
+#RMSE is measured in the same units as response
+#to interpret RMSE: divide it by the mean response
+#so we can interpret in terms of percentage of the mean
+RMSETrain$.estimate/mean(Yc)
+#########################################################################
+
+#predictions based on NA sequence 
+#import new sequence, here I constructed one myself
+library(stringr)
+#Code assumes the fasta file is in your working dir
+#You will have to adjust the name of the file
+#Code assumes the <| and all the enters are removed
+data <- read.table("newsequence.fasta",row.names=1,
+                   colClasses=c("character"))
+colnames(data) <- "SEQUENCE"
+#Remove first 82 amino acids
+seq <- substr(data[1,"SEQUENCE"],83,nchar(data[1,"SEQUENCE"]))
+#Separate the individual letters in the sequence by " "
+splitseq <- gsub("(.{1})","\\1 ",seq)
+#Remove the last character
+splitseq <- substr(splitseq,1,nchar(splitseq)-1)
+#Split sequence into individual amino acids and get in the right format
+colseq <- t(as.data.frame(str_split_1(splitseq," ")))
+#Add to the original sequence
+datanew <- cbind(data[-1],colseq)
+#Select the 100 variable positions that are in the model
+datanew <- datanew[Cons!=0]
+
+#Compare the new sequence to each of the training sequences
+Xnew <- matrix(2,nrow=nrow(S),ncol=ncol(S))
+for (k in 1:ncol(S))
+{
+  for (i in 1:nrow(S))
+  {
+    Xnew[i,k] <- ifelse(datanew[1,k]==S[i,k],0,1)
+  }
+}
+
+#Add row names so you know which sequence it was compared to
+rnamesnew <- c()
+for (i in 1:nrow(S))
+{
+  rnamesnew <- c(rnamesnew,paste0(rownames(datanew[1,]),"-",
+                                  rownames(S[i,])))
+}
+rownames(Xnew) <- rnamesnew
+colnames(Xnew) <- colnames(S)
+
+#Predict antigenic distances of new sequence
+ynew <- predict(rf,Xnew,type="response")
+ynew
+
+#Save the predicted antigenic distances
+#Adjust the name of the file
+write.table(ynew,file="new.sequence.txt",quote=FALSE,col.names=FALSE)
+
+
+
+
+##########################################################################
+
+#rf optimizations:
+
+#Vary number of features
+#mtry <- seq(5,80,by=5)
+#RMSE <- c()
+#for (i in 1:16)
+# {
+#   rf <- randomForest(X,y=Y,ntree=500,
+#                      mtry=mtry[i],keep.forest=TRUE,
+#                      importance=TRUE) 
+#   y_hat <- predict(rf)
+#   test_scored <- cbind(X,Y,y_hat)
+#   RMSETest <- yardstick::rmse(as.data.frame(test_scored),
+#                               truth=Y,
+#                               estimate=y_hat)
+#   RMSE[i] <- RMSETest$.estimate/mean(Y)
+# }
+# df <- as.data.frame(cbind(mtry,RMSE))
+# ggplot(df,aes(mtry,RMSE)) + geom_point()
+
+#Vary number of trees
+# ntree <- seq(100,2000,by=100)
+# RMSE <- c()
+# for (i in 1:20)
+# {
+#   rf <- randomForest(X,y=Y,ntree=ntree[i],mtry=20,
+#                      keep.forest=TRUE,importance=TRUE)
+#   y_hat <- predict(rf)
+#   test_scored <- cbind(X,Y,y_hat)
+#   RMSETest <- yardstick::rmse(as.data.frame(test_scored),
+#                               truth=Y,
+#                               estimate=y_hat)
+#   RMSE[i] <- RMSETest$.estimate/mean(Y)
+# }
+#df <- as.data.frame(cbind(ntree,RMSE))
+#ggplot(df,aes(ntree,RMSE)) + geom_point()
+
+#10-fold cross validation
+#set.seed(222)
+#RMSE <- c()
+#for (i in 1:10)
+#{
+#  ind <- sample(2,nrow(X),replace=TRUE,prob=c(0.9,0.1))
+#  train <- X[ind==1,]
+#  trainy <- Y[ind==1]
+#  test <- X[ind==2,]
+#  testy <- Y[ind==2]
+#  rf <- randomForest(train,y=trainy,xtest=test,ytest=testy,
+#                     ntree=1500,mtry=20,keep.forest=TRUE,
+#                     importance=TRUE)
+#  y_hat <- predict(rf,test)
+#  test_scored <- cbind(test,testy,y_hat)
+#  RMSETest <- yardstick::rmse(as.data.frame(test_scored),
+#                              truth=testy,
+#                              estimate=y_hat)
+#  RMSE[i] <- RMSETest$.estimate/mean(testy)
+#}
+#df <- data.frame(it=1:10,RMSE)
+#ggplot(df,aes(it,RMSE)) + geom_point()
